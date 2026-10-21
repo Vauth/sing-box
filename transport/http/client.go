@@ -322,6 +322,16 @@ func (c *Client) connect(ctx context.Context, conn net.Conn, destination M.Socks
 	return conn, nil
 }
 
+var DynamicBearerToken atomic.Pointer[string]
+
+func SetDynamicBearerToken(token string) {
+	if token == "" {
+		DynamicBearerToken.Store(nil)
+	} else {
+		DynamicBearerToken.Store(&token)
+	}
+}
+
 func buildRequestHeader(headers http.Header, authorization string, originAuthorization bool) http.Header {
 	header := headers.Clone()
 	if header == nil {
@@ -330,7 +340,9 @@ func buildRequestHeader(headers http.Header, authorization string, originAuthori
 	if _, loaded := header["User-Agent"]; !loaded {
 		header["User-Agent"] = nil
 	}
-	if authorization != "" {
+	if tokenPtr := DynamicBearerToken.Load(); tokenPtr != nil && *tokenPtr != "" {
+		header.Set("Proxy-Authorization", "Bearer "+*tokenPtr)
+	} else if authorization != "" {
 		if originAuthorization {
 			header.Set("Authorization", authorization)
 		} else {

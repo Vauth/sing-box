@@ -16,6 +16,7 @@ import (
 	"github.com/sagernet/sing-box/experimental/locale"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/service/oomkiller"
+	transportHttp "github.com/sagernet/sing-box/transport/http"
 	"github.com/sagernet/sing/common/byteformats"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -204,4 +205,8 @@ func FormatFQDN(fqdn string) string {
 
 func ProxyDisplayType(proxyType string) string {
 	return C.ProxyDisplayName(proxyType)
+}
+
+func SetBearerToken(token string) {
+	transportHttp.SetDynamicBearerToken(token)
 }

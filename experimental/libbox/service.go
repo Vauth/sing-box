@@ -224,6 +224,9 @@ func (w *platformInterfaceWrapper) FindConnectionOwner(request *adapter.FindConn
 	if err != nil {
 		return nil, err
 	}
+	if result == nil {
+		return nil, errors.New("connection owner not found")
+	}
 	processPaths := result.processPaths
 	if len(processPaths) == 0 && result.ProcessPath != "" {
 		processPaths = []string{result.ProcessPath}
