@@ -1,0 +1,119 @@
+name: Build and Release Android AAR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag'
+        required: true
+        default: 'v1.15.0-foxy.1'
+        type: string
+      git_ref:
+        description: 'Branch or Git Tag to build from (e.g. main)'
+        required: true
+        default: 'foxy-masque'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build_arch:
+    name: Build AAR (${{ matrix.go_arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go_arch:
+          - "386"
+          - amd64
+          - arm
+          - arm64
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+
+      - name: Setup OpenJDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set build version tag
+        run: |
+          git tag "${{ inputs.version }}" -f
+
+      - name: Compile AAR slice
+        run: |
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go run ./cmd/internal/build_libbox -target android -platform android/${{ matrix.go_arch }}
+          mkdir -p dist/${{ matrix.go_arch }}
+          mv libbox.aar libbox-legacy.aar dist/${{ matrix.go_arch }}/
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+
+      - name: Upload slice artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-android-${{ matrix.go_arch }}
+          path: dist/${{ matrix.go_arch }}
+          compression-level: 0
+
+  release:
+    name: Merge and Publish Release
+    needs: build_arch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Download all architecture slices
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libbox-android-*
+          path: libbox-inputs
+
+      - name: Merge universal fat AARs
+        run: |
+          go run ./cmd/internal/merge_aar -output libbox.aar libbox-inputs/*/libbox.aar
+          go run ./cmd/internal/merge_aar -output libbox-legacy.aar libbox-inputs/*/libbox-legacy.aar
+          ls -lh libbox*.aar
+
+      - name: Create Git Tag and GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f "${{ inputs.version }}"
+          git push origin "${{ inputs.version }}" -f
+
+          gh release create "${{ inputs.version }}" libbox.aar libbox-legacy.aar \
+            --title "${{ inputs.version }}" \
+            --notes "Automated sing-box libbox.aar build from ref '${{ inputs.git_ref }}' as '${{ inputs.version }}' with dynamic Bearer token rotation support for Fastly MASQUE." \
+            --latest
