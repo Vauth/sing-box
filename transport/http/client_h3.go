@@ -32,6 +32,7 @@ type http3ClientImpl struct {
 	server        M.Socksaddr
 	authority     string
 	headers       http.Header
+	bearerToken   *BearerTokenProvider
 	authorization string
 	quicConfig    *quic.Config
 	transport     *http3.Transport
@@ -51,6 +52,9 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 	quicConfig := httpclient.NewQUICConfig(options.HTTP3Options)
 	quicConfig.EnableDatagrams = true
 	headers := options.Headers.Clone()
+	if options.BearerToken != nil {
+		headers.Del("Proxy-Authorization")
+	}
 	authority := options.Server.String()
 	if options.Authority != "" {
 		authority = options.Authority
@@ -67,6 +71,7 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 		server:        options.Server,
 		authority:     authority,
 		headers:       headers,
+		bearerToken:   options.BearerToken,
 		authorization: authorization,
 		quicConfig:    quicConfig,
 		transport:     &http3.Transport{EnableDatagrams: true, DisableCompression: true},
@@ -153,11 +158,15 @@ func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request)
 }
 
 func (c *http3ClientImpl) DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	header, err := buildRequestHeader(c.headers, c.authorization, false, c.bearerToken)
+	if err != nil {
+		return nil, err
+	}
 	stream, _, err := c.openStream(ctx, &http.Request{
 		Method: http.MethodConnect,
 		URL:    &url.URL{Host: destination.String()},
 		Host:   destination.String(),
-		Header: buildRequestHeader(c.headers, c.authorization, false),
+		Header: header,
 	})
 	if err != nil {
 		return nil, err
@@ -169,7 +178,10 @@ func (c *http3ClientImpl) OpenTunnel(ctx context.Context, request tunnelRequest)
 	requestURL := *request.url
 	requestURL.Scheme = "https"
 	requestURL.Host = c.authority
-	header := buildRequestHeader(c.headers, c.authorization, request.originAuthorization)
+	header, err := buildRequestHeader(c.headers, c.authorization, request.originAuthorization, c.bearerToken)
+	if err != nil {
+		return nil, err
+	}
 	header.Set("Capsule-Protocol", "?1")
 	stream, clientConn, err := c.openStream(ctx, &http.Request{
 		Method: http.MethodConnect,

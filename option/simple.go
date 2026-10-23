@@ -90,6 +90,7 @@ type _HTTPOutboundOptions struct {
 	Headers                badoption.HTTPHeader `json:"headers,omitempty"`
 	Version                int                  `json:"version,omitempty" enum:"0,1,2,3"`
 	DisableVersionFallback bool                 `json:"disable_version_fallback,omitempty"`
+	DynamicBearerToken     *bool                `json:"dynamic_bearer_token,omitempty"`
 	HTTP2Options           HTTP2Options         `json:"-"`
 	HTTP3Options           QUICOptions          `json:"-"`
 }

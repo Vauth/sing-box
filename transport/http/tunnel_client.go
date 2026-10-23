@@ -56,7 +56,7 @@ func (c *Client) openTunnel(ctx context.Context, request tunnelRequest) (net.Con
 		}
 		c.markHTTP3Broken()
 	}
-	if !extendedConnectAvailable && c.tlsDialer != nil && c.disableVersionFallback {
+	if !extendedConnectAvailable && c.tlsDialer != nil && (c.disableVersionFallback || c.bearerToken != nil) {
 		return nil, nil, errExtendedConnectUnavailable
 	}
 	if extendedConnectAvailable && c.tlsDialer != nil && !c.http2Unsupported.Load() && !c.http2ExtendedConnectUnsupported.Load() {
@@ -69,16 +69,19 @@ func (c *Client) openTunnel(ctx context.Context, request tunnelRequest) (net.Con
 			if connectErr == nil {
 				return streamConn, nil, nil
 			}
-			if !errors.Is(connectErr, errExtendedConnectUnsupported) || c.disableVersionFallback {
+			if !errors.Is(connectErr, errExtendedConnectUnsupported) || c.disableVersionFallback || c.bearerToken != nil {
 				return nil, nil, connectErr
 			}
 			c.http2ExtendedConnectUnsupported.Store(true)
-		} else if c.disableVersionFallback {
+		} else if c.disableVersionFallback || c.bearerToken != nil {
 			conn.Close()
 			return nil, nil, ErrHTTP2Unsupported
 		} else {
 			return c.openTunnelHTTP1AndClose(ctx, conn, request)
 		}
+	}
+	if c.bearerToken != nil {
+		return nil, nil, ErrHTTP2Unsupported
 	}
 	conn, err := c.http1Dialer.DialContext(ctx, N.NetworkTCP, c.server)
 	if err != nil {
@@ -104,16 +107,20 @@ func (c *Client) openTunnelHTTP1(ctx context.Context, conn net.Conn, request tun
 		conn.Close()
 	})
 	defer stop()
+	header, err := buildRequestHeader(c.headers, c.authorization, request.originAuthorization, c.bearerToken)
+	if err != nil {
+		return nil, err
+	}
 	httpRequest := &http.Request{
 		Method: http.MethodGet,
 		URL:    request.url,
 		Host:   c.authority(),
-		Header: buildRequestHeader(c.headers, c.authorization, request.originAuthorization),
+		Header: header,
 	}
 	httpRequest.Header.Set("Connection", "Upgrade")
 	httpRequest.Header.Set("Upgrade", request.protocol)
 	httpRequest.Header.Set("Capsule-Protocol", "?1")
-	err := httpRequest.Write(conn)
+	err = httpRequest.Write(conn)
 	if err != nil {
 		return nil, E.Cause(err, "write request")
 	}
@@ -147,11 +154,16 @@ func (c *Client) openTunnelHTTP2(ctx context.Context, clientConn *http2ClientCon
 	requestURL := *request.url
 	requestURL.Scheme = "https"
 	requestURL.Host = c.authority()
+	header, err := buildRequestHeader(c.headers, c.authorization, request.originAuthorization, c.bearerToken)
+	if err != nil {
+		clientConn.Close()
+		return nil, err
+	}
 	httpRequest := &http.Request{
 		Method: http.MethodConnect,
 		URL:    &requestURL,
 		Host:   c.authority(),
-		Header: buildRequestHeader(c.headers, c.authorization, request.originAuthorization),
+		Header: header,
 	}
 	httpRequest.Header.Set(":protocol", request.protocol)
 	httpRequest.Header.Set("Capsule-Protocol", "?1")

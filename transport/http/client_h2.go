@@ -45,11 +45,16 @@ func (c *Client) acquireHTTP2(ctx context.Context) (*http2ClientConn, net.Conn, 
 }
 
 func (c *Client) connectHTTP2(ctx context.Context, clientConn *http2ClientConn, destination M.Socksaddr) (net.Conn, error) {
+	header, err := buildRequestHeader(c.headers, c.authorization, false, c.bearerToken)
+	if err != nil {
+		clientConn.Close()
+		return nil, err
+	}
 	request := &http.Request{
 		Method: http.MethodConnect,
 		URL:    &url.URL{Host: destination.String()},
 		Host:   destination.String(),
-		Header: buildRequestHeader(c.headers, c.authorization, false),
+		Header: header,
 	}
 	streamConn, err := c.roundTripHTTP2(ctx, clientConn, request, destination)
 	if err != nil {

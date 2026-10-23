@@ -47,6 +47,7 @@ type ClientOptions struct {
 	Password               string
 	Path                   string
 	Headers                http.Header
+	BearerToken            *BearerTokenProvider
 	Version                int
 	DisableVersionFallback bool
 	HTTP2Options           option.HTTP2Options
@@ -72,6 +73,7 @@ type Client struct {
 	host                            string
 	path                            string
 	headers                         http.Header
+	bearerToken                     *BearerTokenProvider
 	version                         int
 	disableVersionFallback          bool
 	http2Transport                  *http2.Transport
@@ -88,12 +90,18 @@ func NewClientWithTLS(ctx context.Context, logger logger.ContextLogger, outbound
 	if options.Version == 3 && !tlsOptions.Enabled {
 		return nil, C.ErrTLSRequired
 	}
+	if options.BearerToken != nil && !tlsOptions.Enabled {
+		return nil, C.ErrTLSRequired
+	}
 	alpnIsDefault := tlsOptions.Enabled && len(tlsOptions.ALPN) == 0
 	if alpnIsDefault {
 		if options.Version == 1 {
 			tlsOptions.ALPN = []string{"http/1.1"}
 		} else {
-			tlsOptions.ALPN = []string{http2.NextProtoTLS, "http/1.1"}
+			tlsOptions.ALPN = []string{http2.NextProtoTLS}
+			if options.BearerToken == nil {
+				tlsOptions.ALPN = append(tlsOptions.ALPN, "http/1.1")
+			}
 		}
 	}
 	var err error
@@ -101,7 +109,7 @@ func NewClientWithTLS(ctx context.Context, logger logger.ContextLogger, outbound
 	if err != nil {
 		return nil, err
 	}
-	if options.Version >= 2 && (alpnIsDefault || slices.Contains(tlsOptions.ALPN, "http/1.1")) {
+	if options.BearerToken == nil && options.Version >= 2 && (alpnIsDefault || slices.Contains(tlsOptions.ALPN, "http/1.1")) {
 		http1TLSOptions := tlsOptions
 		http1TLSOptions.ALPN = []string{"http/1.1"}
 		options.HTTP1Dialer, err = tls.NewDialerFromOptions(ctx, logger, outboundDialer, serverOptions.Server, http1TLSOptions)
@@ -131,6 +139,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		authorityOverride:      options.Authority,
 		path:                   options.Path,
 		headers:                options.Headers.Clone(),
+		bearerToken:            options.BearerToken,
 		version:                options.Version,
 		disableVersionFallback: options.DisableVersionFallback,
 	}
@@ -142,6 +151,16 @@ func NewClient(options ClientOptions) (*Client, error) {
 		return nil, E.New("Host header and path are not allowed at the same time")
 	}
 	client.version = ResolveVersion(client.version, client.path, client.host)
+	if client.bearerToken != nil {
+		if client.version < 2 {
+			return nil, E.New("dynamic bearer token requires HTTP/2 or HTTP/3")
+		}
+		if options.Username != "" || options.Password != "" {
+			return nil, E.New("dynamic bearer token cannot be combined with username/password")
+		}
+		// Never retain an initial token that could be reused after revocation.
+		client.headers.Del("Proxy-Authorization")
+	}
 	if client.version >= 2 && (client.path != "" || client.host != "") {
 		return nil, E.New("path and Host header are only supported by HTTP/1")
 	}
@@ -159,7 +178,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		}
 		http2Transport.DisableCompression = true
 		client.http2Transport = http2Transport
-	} else if client.version == 2 && options.DisableVersionFallback {
+	} else if client.version == 2 && (options.DisableVersionFallback || client.bearerToken != nil) {
 		return nil, E.New("HTTP/2 requires TLS")
 	}
 	if client.version == 3 && NewHTTP3Client == nil {
@@ -239,11 +258,14 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 		if clientConn != nil {
 			return c.connectHTTP2(ctx, clientConn, destination)
 		}
-		if c.disableVersionFallback {
+		if c.disableVersionFallback || c.bearerToken != nil {
 			conn.Close()
 			return nil, ErrHTTP2Unsupported
 		}
 		return c.connectAndClose(ctx, conn, destination)
+	}
+	if c.bearerToken != nil {
+		return nil, ErrHTTP2Unsupported
 	}
 	conn, err := c.http1Dialer.DialContext(ctx, N.NetworkTCP, c.server)
 	if err != nil {
@@ -294,8 +316,12 @@ func (c *Client) connect(ctx context.Context, conn net.Conn, destination M.Socks
 			return nil, err
 		}
 	}
-	maps.Copy(request.Header, buildRequestHeader(c.headers, c.authorization, false))
-	err := request.Write(conn)
+	header, err := buildRequestHeader(c.headers, c.authorization, false, c.bearerToken)
+	if err != nil {
+		return nil, err
+	}
+	maps.Copy(request.Header, header)
+	err = request.Write(conn)
 	if err != nil {
 		return nil, E.Cause(err, "write request")
 	}
@@ -322,17 +348,7 @@ func (c *Client) connect(ctx context.Context, conn net.Conn, destination M.Socks
 	return conn, nil
 }
 
-var DynamicBearerToken atomic.Pointer[string]
-
-func SetDynamicBearerToken(token string) {
-	if token == "" {
-		DynamicBearerToken.Store(nil)
-	} else {
-		DynamicBearerToken.Store(&token)
-	}
-}
-
-func buildRequestHeader(headers http.Header, authorization string, originAuthorization bool) http.Header {
+func buildRequestHeader(headers http.Header, authorization string, originAuthorization bool, bearerToken *BearerTokenProvider) (http.Header, error) {
 	header := headers.Clone()
 	if header == nil {
 		header = make(http.Header)
@@ -340,8 +356,12 @@ func buildRequestHeader(headers http.Header, authorization string, originAuthori
 	if _, loaded := header["User-Agent"]; !loaded {
 		header["User-Agent"] = nil
 	}
-	if tokenPtr := DynamicBearerToken.Load(); tokenPtr != nil && *tokenPtr != "" {
-		header.Set("Proxy-Authorization", "Bearer "+*tokenPtr)
+	if bearerToken != nil {
+		token := bearerToken.token.Load()
+		if token == nil {
+			return nil, E.New("dynamic bearer token was revoked")
+		}
+		header.Set("Proxy-Authorization", "Bearer "+*token)
 	} else if authorization != "" {
 		if originAuthorization {
 			header.Set("Authorization", authorization)
@@ -349,7 +369,7 @@ func buildRequestHeader(headers http.Header, authorization string, originAuthori
 			header.Set("Proxy-Authorization", authorization)
 		}
 	}
-	return header
+	return header, nil
 }
 
 func (c *Client) Close() error {

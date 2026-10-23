@@ -35,11 +35,19 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	headers := options.Headers.Build()
+	bearerToken, err := http.AcquireBearerTokenProvider(headers, options.DynamicBearerToken)
+	if err != nil {
+		return nil, err
+	}
+	if bearerToken != nil && (options.Username != "" || options.Password != "") {
+		return nil, E.New("dynamic bearer token cannot be combined with username/password")
+	}
 	client, err := http.NewClientWithTLS(ctx, logger, outboundDialer, options.ServerOptions, common.PtrValueOrDefault(options.TLS), http.ClientOptions{
 		Username:               options.Username,
 		Password:               options.Password,
 		Path:                   options.Path,
 		Headers:                headers,
+		BearerToken:            bearerToken,
 		Version:                http.ResolveVersion(options.Version, options.Path, headers.Get("Host")),
 		DisableVersionFallback: options.DisableVersionFallback,
 		HTTP2Options:           options.HTTP2Options,
