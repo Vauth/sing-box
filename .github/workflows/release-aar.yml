@@ -4,116 +4,216 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version tag'
+        description: New release tag (existing tags cannot be replaced)
         required: true
-        default: 'v1.15.0-foxy.1'
+        default: v1.15.0-foxy-masque.3
         type: string
       git_ref:
-        description: 'Branch or Git Tag to build from (e.g. main)'
+        description: Branch, tag, or commit to build
         required: true
-        default: 'foxy-masque'
+        default: foxy-masque
         type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-aar-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  LIBBOX_GO_VERSION: 1.26.10
+  LIBBOX_NDK_VERSION: 28.0.13004108
+  GOTOOLCHAIN: local
+  GOMAXPROCS: "2"
+  GOFLAGS: -p=2
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release and pin source
+        id: source
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          git check-ref-format "refs/tags/$VERSION"
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            echo "Release tag already exists: $VERSION" >&2
+            exit 1
+          fi
+          test -f experimental/libbox/account_http.go
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+            --jq '.[].tag_name' > "$RUNNER_TEMP/release-tags"
+          if grep -Fxq "$VERSION" "$RUNNER_TEMP/release-tags"; then
+            echo "Release already exists: $VERSION" >&2
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   build_arch:
     name: Build AAR (${{ matrix.go_arch }})
+    needs: prepare
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        go_arch:
-          - "386"
-          - amd64
-          - arm
-          - arm64
+        go_arch: ["386", amd64, arm, arm64]
     steps:
-      - name: Checkout selected ref
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
           fetch-depth: 0
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+          persist-credentials: false
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ env.LIBBOX_GO_VERSION }}
           cache: false
-
-      - name: Setup Android NDK
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r28
-
-      - name: Setup OpenJDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-
-      - name: Set build version tag
-        run: |
-          git tag "${{ inputs.version }}" -f
-
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+      - name: Install pinned Android NDK
+        run: sdkmanager "ndk;$LIBBOX_NDK_VERSION"
       - name: Compile AAR slice
-        run: |
-          make lib_install
-          export PATH="$PATH:$(go env GOPATH)/bin"
-          go run ./cmd/internal/build_libbox -target android -platform android/${{ matrix.go_arch }}
-          mkdir -p dist/${{ matrix.go_arch }}
-          mv libbox.aar libbox-legacy.aar dist/${{ matrix.go_arch }}/
+        shell: bash
         env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-
-      - name: Upload slice artifact
-        uses: actions/upload-artifact@v4
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          GO_ARCH: ${{ matrix.go_arch }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git tag "$VERSION" "$SOURCE_SHA"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$LIBBOX_NDK_VERSION"
+          make lib_install
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          go run ./cmd/internal/build_libbox -target android -platform "android/$GO_ARCH"
+          mkdir -p "dist/$GO_ARCH"
+          mv libbox.aar libbox-legacy.aar "dist/$GO_ARCH/"
+      - uses: actions/upload-artifact@v4
         with:
           name: libbox-android-${{ matrix.go_arch }}
-          path: dist/${{ matrix.go_arch }}
+          path: dist/${{ matrix.go_arch }}/
+          if-no-files-found: error
           compression-level: 0
+          retention-days: 7
 
   release:
-    name: Merge and Publish Release
-    needs: build_arch
+    name: Verify and publish AARs
+    needs: [prepare, build_arch]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
-      - name: Checkout selected ref
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
           fetch-depth: 0
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+          persist-credentials: false
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ env.LIBBOX_GO_VERSION }}
           cache: false
-
-      - name: Download all architecture slices
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           pattern: libbox-android-*
           path: libbox-inputs
-
-      - name: Merge universal fat AARs
+      - name: Merge and verify AARs
+        shell: bash
         run: |
+          set -euo pipefail
           go run ./cmd/internal/merge_aar -output libbox.aar libbox-inputs/*/libbox.aar
           go run ./cmd/internal/merge_aar -output libbox-legacy.aar libbox-inputs/*/libbox-legacy.aar
-          ls -lh libbox*.aar
+          python3 - <<'PY'
+          import io
+          import zipfile
 
-      - name: Create Git Tag and GitHub Release
+          expected_abis = {"armeabi-v7a", "arm64-v8a", "x86", "x86_64"}
+          expected_classes = {
+              "io/nekohasekai/libbox/AccountHTTPClient.class",
+              "io/nekohasekai/libbox/AccountHTTPNetwork.class",
+              "io/nekohasekai/libbox/AccountHTTPRequest.class",
+              "io/nekohasekai/libbox/AccountHTTPResponse.class",
+          }
+          for name in ("libbox.aar", "libbox-legacy.aar"):
+              with zipfile.ZipFile(name) as aar:
+                  if aar.testzip() is not None:
+                      raise SystemExit(f"Corrupt AAR: {name}")
+                  abis = {
+                      path.split("/")[1]
+                      for path in aar.namelist()
+                      if path.startswith("jni/") and path.endswith("/libbox.so")
+                  }
+                  if abis != expected_abis:
+                      raise SystemExit(f"Incorrect ABIs in {name}: {sorted(abis)}")
+                  with zipfile.ZipFile(io.BytesIO(aar.read("classes.jar"))) as classes:
+                      if classes.testzip() is not None:
+                          raise SystemExit(f"Corrupt bindings: {name}")
+                      if not expected_classes.issubset(classes.namelist()):
+                          raise SystemExit(f"Missing account HTTP bindings: {name}")
+                  print(f"Verified {name}: four ABIs and account HTTP bindings")
+          PY
+      - name: Record provenance and checksums
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -f "${{ inputs.version }}"
-          git push origin "${{ inputs.version }}" -f
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-          gh release create "${{ inputs.version }}" libbox.aar libbox-legacy.aar \
-            --title "${{ inputs.version }}" \
-            --notes "Automated sing-box libbox.aar build from ref '${{ inputs.git_ref }}' as '${{ inputs.version }}' with dynamic Bearer token rotation support for Fastly MASQUE." \
-            --latest
+          info = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "commit": os.environ["SOURCE_SHA"],
+              "version": os.environ["VERSION"],
+              "go": os.environ["LIBBOX_GO_VERSION"],
+              "ndk": os.environ["LIBBOX_NDK_VERSION"],
+              "abis": ["armeabi-v7a", "arm64-v8a", "x86", "x86_64"],
+              "android_api": {"libbox.aar": 24, "libbox-legacy.aar": 21},
+              "run": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }
+          Path("build-info.json").write_text(json.dumps(info, indent=2) + "\n")
+          PY
+          sha256sum libbox.aar libbox-legacy.aar build-info.json > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - name: Publish new release without replacing tags
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            echo "Release tag already exists: $VERSION" >&2
+            exit 1
+          fi
+          gh release create "$VERSION" \
+            libbox.aar libbox-legacy.aar SHA256SUMS build-info.json \
+            --target "$SOURCE_SHA" \
+            --title "$VERSION" \
+            --notes "Android libbox AARs with MASQUE token rotation and the Foxy account HTTP transport. Source: $SOURCE_SHA. Toolchain and checksums are attached." \
+            --latest=false
