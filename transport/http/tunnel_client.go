@@ -56,7 +56,7 @@ func (c *Client) openTunnel(ctx context.Context, request tunnelRequest) (net.Con
 		}
 		c.markHTTP3Broken()
 	}
-	if !extendedConnectAvailable && c.tlsDialer != nil && (c.disableVersionFallback || c.bearerToken != nil) {
+	if !extendedConnectAvailable && c.tlsDialer != nil && c.disableVersionFallback {
 		return nil, nil, errExtendedConnectUnavailable
 	}
 	if extendedConnectAvailable && c.tlsDialer != nil && !c.http2Unsupported.Load() && !c.http2ExtendedConnectUnsupported.Load() {
@@ -69,19 +69,16 @@ func (c *Client) openTunnel(ctx context.Context, request tunnelRequest) (net.Con
 			if connectErr == nil {
 				return streamConn, nil, nil
 			}
-			if !errors.Is(connectErr, errExtendedConnectUnsupported) || c.disableVersionFallback || c.bearerToken != nil {
+			if !errors.Is(connectErr, errExtendedConnectUnsupported) || c.disableVersionFallback {
 				return nil, nil, connectErr
 			}
 			c.http2ExtendedConnectUnsupported.Store(true)
-		} else if c.disableVersionFallback || c.bearerToken != nil {
+		} else if c.disableVersionFallback {
 			conn.Close()
 			return nil, nil, ErrHTTP2Unsupported
 		} else {
 			return c.openTunnelHTTP1AndClose(ctx, conn, request)
 		}
-	}
-	if c.bearerToken != nil {
-		return nil, nil, ErrHTTP2Unsupported
 	}
 	conn, err := c.http1Dialer.DialContext(ctx, N.NetworkTCP, c.server)
 	if err != nil {

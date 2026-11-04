@@ -90,18 +90,12 @@ func NewClientWithTLS(ctx context.Context, logger logger.ContextLogger, outbound
 	if options.Version == 3 && !tlsOptions.Enabled {
 		return nil, C.ErrTLSRequired
 	}
-	if options.BearerToken != nil && !tlsOptions.Enabled {
-		return nil, C.ErrTLSRequired
-	}
 	alpnIsDefault := tlsOptions.Enabled && len(tlsOptions.ALPN) == 0
 	if alpnIsDefault {
 		if options.Version == 1 {
 			tlsOptions.ALPN = []string{"http/1.1"}
 		} else {
-			tlsOptions.ALPN = []string{http2.NextProtoTLS}
-			if options.BearerToken == nil {
-				tlsOptions.ALPN = append(tlsOptions.ALPN, "http/1.1")
-			}
+			tlsOptions.ALPN = []string{http2.NextProtoTLS, "http/1.1"}
 		}
 	}
 	var err error
@@ -109,7 +103,7 @@ func NewClientWithTLS(ctx context.Context, logger logger.ContextLogger, outbound
 	if err != nil {
 		return nil, err
 	}
-	if options.BearerToken == nil && options.Version >= 2 && (alpnIsDefault || slices.Contains(tlsOptions.ALPN, "http/1.1")) {
+	if options.Version >= 2 && (alpnIsDefault || slices.Contains(tlsOptions.ALPN, "http/1.1")) {
 		http1TLSOptions := tlsOptions
 		http1TLSOptions.ALPN = []string{"http/1.1"}
 		options.HTTP1Dialer, err = tls.NewDialerFromOptions(ctx, logger, outboundDialer, serverOptions.Server, http1TLSOptions)
@@ -152,9 +146,6 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}
 	client.version = ResolveVersion(client.version, client.path, client.host)
 	if client.bearerToken != nil {
-		if client.version < 2 {
-			return nil, E.New("dynamic bearer token requires HTTP/2 or HTTP/3")
-		}
 		if options.Username != "" || options.Password != "" {
 			return nil, E.New("dynamic bearer token cannot be combined with username/password")
 		}
@@ -178,7 +169,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		}
 		http2Transport.DisableCompression = true
 		client.http2Transport = http2Transport
-	} else if client.version == 2 && (options.DisableVersionFallback || client.bearerToken != nil) {
+	} else if client.version == 2 && options.DisableVersionFallback {
 		return nil, E.New("HTTP/2 requires TLS")
 	}
 	if client.version == 3 && NewHTTP3Client == nil {
@@ -258,14 +249,11 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 		if clientConn != nil {
 			return c.connectHTTP2(ctx, clientConn, destination)
 		}
-		if c.disableVersionFallback || c.bearerToken != nil {
+		if c.disableVersionFallback {
 			conn.Close()
 			return nil, ErrHTTP2Unsupported
 		}
 		return c.connectAndClose(ctx, conn, destination)
-	}
-	if c.bearerToken != nil {
-		return nil, ErrHTTP2Unsupported
 	}
 	conn, err := c.http1Dialer.DialContext(ctx, N.NetworkTCP, c.server)
 	if err != nil {
