@@ -5,8 +5,8 @@ import (
 	"crypto/x509"
 	"net"
 
-	utls "github.com/refraction-networking/utls"
-	"github.com/refraction-networking/utls/dicttls"
+	utls "github.com/metacubex/utls"
+	"github.com/metacubex/utls/dicttls"
 )
 
 // 0x11ec is the IANA TLS ID for X25519MLKEM768. Using this constant directly
