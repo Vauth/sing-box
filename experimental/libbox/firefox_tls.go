@@ -9,13 +9,12 @@ import (
 	"github.com/metacubex/utls/dicttls"
 )
 
-// 0x11ec is the IANA TLS ID for X25519MLKEM768. Using this constant directly
-// guarantees compatibility across all uTLS versions without depending on symbol definitions.
-const curveX25519MLKEM768 utls.CurveID = 0x11ec
+// ffCurveX25519MLKEM768 is the IANA TLS ID for X25519MLKEM768 (0x11ec).
+const ffCurveX25519MLKEM768 utls.CurveID = 0x11ec
 
-// firefoxHelloSpec creates the ClientHello of desktop Firefox 158 in its exact extension order,
+// ffFirefoxHelloSpec creates the ClientHello of desktop Firefox 158 in its exact extension order,
 // identical to Arman's firefoxtls.Hello implementation.
-func firefoxHelloSpec(alpn ...string) *utls.ClientHelloSpec {
+func ffFirefoxHelloSpec(alpn ...string) *utls.ClientHelloSpec {
 	return &utls.ClientHelloSpec{
 		TLSVersMin: utls.VersionTLS12,
 		TLSVersMax: utls.VersionTLS13,
@@ -42,7 +41,7 @@ func firefoxHelloSpec(alpn ...string) *utls.ClientHelloSpec {
 			&utls.ExtendedMasterSecretExtension{},
 			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
 			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
-				curveX25519MLKEM768, utls.X25519, utls.CurveP256, utls.CurveP384, utls.CurveP521,
+				ffCurveX25519MLKEM768, utls.X25519, utls.CurveP256, utls.CurveP384, utls.CurveP521,
 			}},
 			&utls.SupportedPointsExtension{SupportedPoints: []uint8{0}},
 			&utls.SessionTicketExtension{},
@@ -53,7 +52,7 @@ func firefoxHelloSpec(alpn ...string) *utls.ClientHelloSpec {
 			}},
 			&utls.SCTExtension{},
 			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
-				{Group: curveX25519MLKEM768}, {Group: utls.X25519}, {Group: utls.CurveP256},
+				{Group: ffCurveX25519MLKEM768}, {Group: utls.X25519}, {Group: utls.CurveP256},
 			}},
 			&utls.SupportedVersionsExtension{Versions: []uint16{utls.VersionTLS13, utls.VersionTLS12}},
 			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
@@ -79,16 +78,16 @@ func firefoxHelloSpec(alpn ...string) *utls.ClientHelloSpec {
 	}
 }
 
-// handshakeFirefoxTLS executes the TLS handshake with desktop Firefox ClientHello.
+// ffHandshakeTLS executes the TLS handshake with desktop Firefox ClientHello.
 // It guarantees the socket is closed if the handshake fails.
-func handshakeFirefoxTLS(ctx context.Context, raw net.Conn, name string, roots *x509.CertPool, cache utls.ClientSessionCache, alpn ...string) (*utls.UConn, error) {
+func ffHandshakeTLS(ctx context.Context, raw net.Conn, name string, roots *x509.CertPool, cache utls.ClientSessionCache, alpn ...string) (*utls.UConn, error) {
 	conn := utls.UClient(raw, &utls.Config{
 		RootCAs:            roots,
 		ServerName:         name,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, utls.HelloCustom)
-	if err := conn.ApplyPreset(firefoxHelloSpec(alpn...)); err != nil {
+	if err := conn.ApplyPreset(ffFirefoxHelloSpec(alpn...)); err != nil {
 		_ = raw.Close()
 		return nil, err
 	}

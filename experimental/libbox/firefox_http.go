@@ -39,247 +39,263 @@ type SocketProtector interface {
 }
 
 var (
-	globalJarMu  sync.RWMutex
-	globalJar, _ = cookiejar.New(nil)
-
-	globalStateMu       sync.RWMutex
-	globalProtector     SocketProtector
-	globalUpstreamProxy *url.URL
-	globalDoHURL        string
-	globalDNSServer     string
-)
-
-var (
-	dohBootstrapMu sync.RWMutex
-	dohIPCache     = make(map[string][]net.IP)
-	hardcodedDoHIPs = map[string][]string{
-		"cloudflare-dns.com": {"1.1.1.1", "1.0.0.1"},
-		"dns.google":         {"8.8.8.8", "8.8.4.4"},
-		"dns.quad9.net":      {"9.9.9.9", "149.112.112.112"},
+	ffConfigLock      sync.RWMutex
+	ffCookieJar       *cookiejar.Jar
+	ffSessions        = utls.NewLRUClientSessionCache(64)
+	ffHTTPClient      *http.Client
+	ffUpstreamProxy   string
+	ffDoHURL          string
+	ffCustomDNS       string
+	ffSocketProtector SocketProtector
+	ffDohClient       = &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			ForceAttemptHTTP2:   true,
+			MaxIdleConns:        4,
+			IdleConnTimeout:     60 * time.Second,
+			TLSHandshakeTimeout: 5 * time.Second,
+			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(address)
+				if err == nil {
+					// Bootstrap well-known DoH providers directly by IP to bypass local DNS poisoning
+					switch strings.ToLower(host) {
+					case "cloudflare-dns.com", "one.one.one.one":
+						address = net.JoinHostPort("1.1.1.1", port)
+					case "dns.google":
+						address = net.JoinHostPort("8.8.8.8", port)
+					case "dns.quad9.net":
+						address = net.JoinHostPort("9.9.9.9", port)
+					}
+				}
+				dialer := ffNewProtectedDialer(5 * time.Second)
+				return dialer.DialContext(ctx, network, address)
+			},
+		},
 	}
 )
 
+// FirefoxSetSocketProtector sets a socket protector callback (VpnService.protect(fd)).
+// Ensures outbound sockets are routed through the physical network when the VPN is active.
 func FirefoxSetSocketProtector(protector SocketProtector) {
-	globalStateMu.Lock()
-	defer globalStateMu.Unlock()
-	globalProtector = protector
+	ffConfigLock.Lock()
+	defer ffConfigLock.Unlock()
+	ffSocketProtector = protector
 }
 
-func getSocketProtector() SocketProtector {
-	globalStateMu.RLock()
-	defer globalStateMu.RUnlock()
-	return globalProtector
+func ffCloseIdleLocked() {
+	if ffHTTPClient != nil {
+		if tr, ok := ffHTTPClient.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+		ffHTTPClient = nil
+	}
 }
 
+// FirefoxSetUpstreamProxy sets an upstream proxy for all Firefox uTLS requests.
+// Accepts: "socks5://host:port", "socks5://user:pass@host:port", "http://host:port", or "" to disable.
 func FirefoxSetUpstreamProxy(proxyURL string) error {
-	globalStateMu.Lock()
-	defer globalStateMu.Unlock()
-	if strings.TrimSpace(proxyURL) == "" {
-		globalUpstreamProxy = nil
-		return nil
+	ffConfigLock.Lock()
+	defer ffConfigLock.Unlock()
+
+	trimmed := strings.TrimSpace(proxyURL)
+	if trimmed != "" {
+		parsed, err := url.Parse(trimmed)
+		if err != nil {
+			return fmt.Errorf("invalid proxy url: %w", err)
+		}
+		scheme := strings.ToLower(parsed.Scheme)
+		if scheme != "socks5" && scheme != "http" && scheme != "https" {
+			return fmt.Errorf("unsupported proxy scheme %q, must be socks5 or http", scheme)
+		}
 	}
-	parsed, err := url.Parse(proxyURL)
-	if err != nil {
-		return fmt.Errorf("invalid upstream proxy URL: %w", err)
-	}
-	scheme := strings.ToLower(parsed.Scheme)
-	if scheme != "http" && scheme != "https" && scheme != "socks5" && scheme != "socks5h" {
-		return fmt.Errorf("unsupported upstream proxy scheme: %s (supported: http, https, socks5, socks5h)", scheme)
-	}
-	globalUpstreamProxy = parsed
+
+	ffUpstreamProxy = trimmed
+	ffCloseIdleLocked()
 	return nil
 }
 
-func getUpstreamProxy() *url.URL {
-	globalStateMu.RLock()
-	defer globalStateMu.RUnlock()
-	return globalUpstreamProxy
-}
-
+// FirefoxSetDoH sets a DNS-over-HTTPS URL (e.g. "https://cloudflare-dns.com/dns-query" or "https://dns.google/dns-query").
+// Pass empty string "" to disable DoH and use system/UDP DNS.
 func FirefoxSetDoH(dohURL string) {
-	globalStateMu.Lock()
-	defer globalStateMu.Unlock()
-	globalDoHURL = strings.TrimSpace(dohURL)
+	ffConfigLock.Lock()
+	defer ffConfigLock.Unlock()
+	ffDoHURL = strings.TrimSpace(dohURL)
+	ffCloseIdleLocked()
 }
 
+// FirefoxSetDNS sets a custom UDP DNS resolver (e.g. "1.1.1.1" or "8.8.8.8:53").
+// Pass empty string "" to use system DNS.
 func FirefoxSetDNS(dnsServer string) {
-	globalStateMu.Lock()
-	defer globalStateMu.Unlock()
-	globalDNSServer = strings.TrimSpace(dnsServer)
+	ffConfigLock.Lock()
+	defer ffConfigLock.Unlock()
+	ffCustomDNS = strings.TrimSpace(dnsServer)
+	ffCloseIdleLocked()
 }
 
+// FirefoxClearCookies resets the shared cookie jar.
 func FirefoxClearCookies() {
-	globalJarMu.Lock()
-	defer globalJarMu.Unlock()
-	globalJar, _ = cookiejar.New(nil)
+	ffConfigLock.Lock()
+	defer ffConfigLock.Unlock()
+	jar, _ := cookiejar.New(nil)
+	ffCookieJar = jar
+	if ffHTTPClient != nil {
+		ffHTTPClient.Jar = jar
+	}
 }
 
+// FirefoxSetCookie sets a cookie for targetURL in the shared jar.
 func FirefoxSetCookie(targetURL string, cookieHeader string) error {
-	parsed, err := url.Parse(targetURL)
+	ffConfigLock.Lock()
+	defer ffConfigLock.Unlock()
+	if ffCookieJar == nil {
+		jar, err := cookiejar.New(nil)
+		if err != nil {
+			return err
+		}
+		ffCookieJar = jar
+	}
+	u, err := url.Parse(targetURL)
 	if err != nil {
 		return err
 	}
-	req := &http.Request{Header: http.Header{"Set-Cookie": []string{cookieHeader}}}
-	cookies := req.Cookies()
-	if len(cookies) == 0 {
-		return errors.New("no valid cookie parsed from header")
-	}
-	globalJarMu.Lock()
-	defer globalJarMu.Unlock()
-	if globalJar == nil {
-		globalJar, _ = cookiejar.New(nil)
-	}
-	globalJar.SetCookies(parsed, cookies)
+	rawResp := &http.Response{Header: http.Header{"Set-Cookie": []string{cookieHeader}}}
+	ffCookieJar.SetCookies(u, rawResp.Cookies())
 	return nil
 }
 
+// FirefoxGetCookies returns the Cookie header string for targetURL from the shared jar (e.g. "name1=val1; name2=val2").
 func FirefoxGetCookies(targetURL string) string {
-	parsed, err := url.Parse(targetURL)
+	ffConfigLock.RLock()
+	defer ffConfigLock.RUnlock()
+	if ffCookieJar == nil {
+		return ""
+	}
+	u, err := url.Parse(targetURL)
 	if err != nil {
 		return ""
 	}
-	globalJarMu.RLock()
-	jar := globalJar
-	globalJarMu.RUnlock()
-	if jar == nil {
-		return ""
-	}
-	cookies := jar.Cookies(parsed)
+	cookies := ffCookieJar.Cookies(u)
 	if len(cookies) == 0 {
 		return ""
 	}
-	var pairs []string
+	parts := make([]string, 0, len(cookies))
 	for _, c := range cookies {
-		pairs = append(pairs, fmt.Sprintf("%s=%s", c.Name, c.Value))
+		parts = append(parts, c.String())
 	}
-	return strings.Join(pairs, "; ")
+	return strings.Join(parts, "; ")
 }
 
-func dialWithProtection(ctx context.Context, network, address string, protector SocketProtector) (net.Conn, error) {
-	dialer := &net.Dialer{
-		Timeout:   10 * time.Second,
+func ffNewProtectedDialer(timeout time.Duration) *net.Dialer {
+	return &net.Dialer{
+		Timeout:   timeout,
 		KeepAlive: 30 * time.Second,
-	}
-	if protector != nil {
-		dialer.Control = func(network, address string, c syscall.RawConn) error {
+		Control: func(network, address string, c syscall.RawConn) error {
 			var protectErr error
 			err := c.Control(func(fd uintptr) {
-				protectErr = protector.Protect(int32(fd))
+				ffConfigLock.RLock()
+				protector := ffSocketProtector
+				ffConfigLock.RUnlock()
+				if protector != nil {
+					protectErr = protector.Protect(int32(fd))
+				}
 			})
 			if err != nil {
 				return err
 			}
 			return protectErr
-		}
+		},
 	}
-	return dialer.DialContext(ctx, network, address)
 }
 
-func resolveBootstrapDoHIP(ctx context.Context, host string, protector SocketProtector) net.IP {
-	dohBootstrapMu.RLock()
-	cached, ok := dohIPCache[host]
-	dohBootstrapMu.RUnlock()
-	if ok && len(cached) > 0 {
-		return cached[0]
+func ffResolveHost(ctx context.Context, host string) ([]string, error) {
+	if net.ParseIP(host) != nil {
+		return []string{host}, nil
 	}
-	if ips, found := hardcodedDoHIPs[host]; found && len(ips) > 0 {
-		for _, ipStr := range ips {
-			if parsed := net.ParseIP(ipStr); parsed != nil {
-				return parsed
+
+	ffConfigLock.RLock()
+	dohURL := ffDoHURL
+	customDNS := ffCustomDNS
+	ffConfigLock.RUnlock()
+
+	if dohURL != "" {
+		ips, err := ffResolveViaDoH(ctx, dohURL, host)
+		if err == nil && len(ips) > 0 {
+			res := make([]string, 0, len(ips))
+			for _, ip := range ips {
+				res = append(res, ip.String())
 			}
+			return res, nil
 		}
-	}
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	if protector != nil {
-		dialer.Control = func(network, address string, c syscall.RawConn) error {
-			var protectErr error
-			_ = c.Control(func(fd uintptr) {
-				protectErr = protector.Protect(int32(fd))
-			})
-			return protectErr
-		}
-	}
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "udp", "1.1.1.1:53")
-		},
-	}
-	addrs, err := resolver.LookupIPAddr(ctx, host)
-	if err == nil && len(addrs) > 0 {
-		var resolved []net.IP
-		for _, a := range addrs {
-			resolved = append(resolved, a.IP)
-		}
-		dohBootstrapMu.Lock()
-		dohIPCache[host] = resolved
-		dohBootstrapMu.Unlock()
-		return resolved[0]
-	}
-	return nil
-}
-
-func queryDoH(ctx context.Context, dohURLStr string, host string, protector SocketProtector) ([]net.IP, error) {
-	dohURL, err := url.Parse(dohURLStr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid DoH URL: %w", err)
 	}
 
-	msg := dnsmessage.Message{
-		Header: dnsmessage.Header{
-			ID:               0x4658,
-			RecursionDesired: true,
-		},
-		Questions: []dnsmessage.Question{
-			{
-				Name:  dnsmessage.MustNewName(dnsmessage.Fqdn(host)),
-				Type:  dnsmessage.TypeA,
-				Class: dnsmessage.ClassINET,
+	if customDNS != "" {
+		targetDNS := customDNS
+		if _, _, err := net.SplitHostPort(targetDNS); err != nil {
+			targetDNS = net.JoinHostPort(targetDNS, "53")
+		}
+		resolver := &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := ffNewProtectedDialer(5 * time.Second)
+				return d.DialContext(ctx, "udp", targetDNS)
 			},
-		},
-	}
-	packed, err := msg.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("failed packing DNS query: %w", err)
-	}
-
-	bootstrapIP := resolveBootstrapDoHIP(ctx, dohURL.Hostname(), protector)
-
-	transport := &http.Transport{
-		DisableKeepAlives: true,
-		DialContext: func(dCtx context.Context, network, address string) (net.Conn, error) {
-			targetAddr := address
-			if bootstrapIP != nil {
-				port := dohURL.Port()
-				if port == "" {
-					port = "443"
+		}
+		ips, err := resolver.LookupIP(ctx, "ip4", host)
+		if err == nil && len(ips) > 0 {
+			var res []string
+			for _, ip := range ips {
+				if !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() {
+					res = append(res, ip.String())
 				}
-				targetAddr = net.JoinHostPort(bootstrapIP.String(), port)
 			}
-			return dialWithProtection(dCtx, network, targetAddr, protector)
-		},
-		TLSClientConfig: &tls.Config{
-			ServerName: dohURL.Hostname(),
-		},
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   6 * time.Second,
+			if len(res) > 0 {
+				return res, nil
+			}
+		}
 	}
 
-	dnsParam := base64.RawURLEncoding.EncodeToString(packed)
-	dohReqURL := fmt.Sprintf("%s?dns=%s", dohURLStr, dnsParam)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dohReqURL, nil)
+	// Fallback to system resolver
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/dns-message")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0")
+	var res []string
+	for _, ip := range ips {
+		if !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() {
+			res = append(res, ip.String())
+		}
+	}
+	if len(res) > 0 {
+		return res, nil
+	}
+	return nil, fmt.Errorf("no resolved IP for %s", host)
+}
 
-	resp, err := client.Do(req)
+func ffResolveViaDoH(ctx context.Context, dohURL string, host string) ([]net.IP, error) {
+	name, err := dnsmessage.NewName(host + ".")
 	if err != nil {
-		return nil, fmt.Errorf("DoH HTTP request failed: %w", err)
+		return nil, err
+	}
+	msg := dnsmessage.Message{
+		Header:    dnsmessage.Header{RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+	}
+	packed, err := msg.Pack()
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dohURL, bytes.NewReader(packed))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+
+	resp, err := ffDohClient.Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -287,378 +303,320 @@ func queryDoH(ctx context.Context, dohURLStr string, host string, protector Sock
 		return nil, fmt.Errorf("DoH server returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		return nil, err
 	}
 
-	var parsedMsg dnsmessage.Message
-	if err := parsedMsg.Unpack(body); err != nil {
-		return nil, fmt.Errorf("failed unpacking DoH response: %w", err)
-	}
-
-	var ips []net.IP
-	for _, ans := range parsedMsg.Answers {
-		if ans.Header.Type == dnsmessage.TypeA {
-			if aResource, ok := ans.Body.(*dnsmessage.AResource); ok {
-				ips = append(ips, net.IP(aResource.A[:]))
-			}
-		}
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no A records returned by DoH for %s", host)
-	}
-	return ips, nil
-}
-
-func resolveHost(ctx context.Context, host string, protector SocketProtector) ([]net.IP, error) {
-	if ip := net.ParseIP(host); ip != nil {
-		return []net.IP{ip}, nil
-	}
-
-	globalStateMu.RLock()
-	doh := globalDoHURL
-	targetDNS := globalDNSServer
-	globalStateMu.RUnlock()
-
-	if doh != "" {
-		ips, err := queryDoH(ctx, doh, host, protector)
-		if err == nil && len(ips) > 0 {
-			return ips, nil
-		}
-	}
-
-	if targetDNS != "" {
-		hostPart, portPart, err := net.SplitHostPort(targetDNS)
-		if err != nil {
-			targetDNS = net.JoinHostPort(targetDNS, "53")
-		} else if portPart == "" {
-			targetDNS = net.JoinHostPort(hostPart, "53")
-		}
-
-		dialer := &net.Dialer{Timeout: 5 * time.Second}
-		if protector != nil {
-			dialer.Control = func(network, address string, c syscall.RawConn) error {
-				var protectErr error
-				_ = c.Control(func(fd uintptr) {
-					protectErr = protector.Protect(int32(fd))
-				})
-				return protectErr
-			}
-		}
-		resolver := &net.Resolver{
-			PreferGo: true,
-			Dial: func(dCtx context.Context, network, address string) (net.Conn, error) {
-				return dialer.DialContext(dCtx, "udp", targetDNS)
-			},
-		}
-		addrs, err := resolver.LookupIPAddr(ctx, host)
-		if err == nil && len(addrs) > 0 {
-			var ips []net.IP
-			for _, a := range addrs {
-				ips = append(ips, a.IP)
-			}
-			return ips, nil
-		}
-	}
-
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	if protector != nil {
-		dialer.Control = func(network, address string, c syscall.RawConn) error {
-			var protectErr error
-			_ = c.Control(func(fd uintptr) {
-				protectErr = protector.Protect(int32(fd))
-			})
-			return protectErr
-		}
-	}
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(dCtx context.Context, network, address string) (net.Conn, error) {
-			return dialer.DialContext(dCtx, network, address)
-		},
-	}
-	addrs, err := resolver.LookupIPAddr(ctx, host)
+	var p dnsmessage.Parser
+	header, err := p.Start(body)
 	if err != nil {
-		return nil, fmt.Errorf("failed resolving %s: %w", host, err)
+		return nil, err
 	}
+	if header.RCode != dnsmessage.RCodeSuccess {
+		return nil, fmt.Errorf("DoH error code %s", header.RCode)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		return nil, err
+	}
+
 	var ips []net.IP
-	for _, a := range addrs {
-		ips = append(ips, a.IP)
+	for {
+		h, err := p.AnswerHeader()
+		if errors.Is(err, dnsmessage.ErrSectionDone) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if h.Type != dnsmessage.TypeA {
+			if err := p.SkipAnswer(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		r, err := p.AResource()
+		if err != nil {
+			return nil, err
+		}
+		ip := net.IP(r.A[:])
+		// Matches Arman's IsBlockPage check: filter out private, loopback, link-local, and Iranian DNS poison IPs (10.10.34.34-36)
+		if ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		ips = append(ips, ip)
+	}
+
+	if len(ips) == 0 {
+		return nil, errors.New("no public A record in DoH response")
 	}
 	return ips, nil
 }
 
-func dialUpstreamProxy(ctx context.Context, proxyURL *url.URL, targetHost, targetPort string, protector SocketProtector) (net.Conn, error) {
-	scheme := strings.ToLower(proxyURL.Scheme)
-	proxyHost := proxyURL.Hostname()
-	proxyPort := proxyURL.Port()
+type ffBufferedConn struct {
+	r io.Reader
+	net.Conn
+}
+
+func (c *ffBufferedConn) Read(b []byte) (int, error) {
+	return c.r.Read(b)
+}
+
+func ffDialWithOptionalProxy(ctx context.Context, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+		port = "443"
+	}
+
+	ffConfigLock.RLock()
+	proxyStr := ffUpstreamProxy
+	ffConfigLock.RUnlock()
+
+	baseDialer := ffNewProtectedDialer(20 * time.Second)
+
+	// When no proxy is configured, resolve destination via DoH/custom DNS directly
+	if proxyStr == "" {
+		ips, err := ffResolveHost(ctx, host)
+		if err == nil && len(ips) > 0 {
+			for _, ip := range ips {
+				targetTCPAddr := net.JoinHostPort(ip, port)
+				conn, err := baseDialer.DialContext(ctx, "tcp", targetTCPAddr)
+				if err == nil {
+					return conn, nil
+				}
+			}
+		}
+		// Fallback to dialing host directly
+		return baseDialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	}
+
+	proxyParsed, err := url.Parse(proxyStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse upstream proxy: %w", err)
+	}
+
+	scheme := strings.ToLower(proxyParsed.Scheme)
+	proxyHost := proxyParsed.Host
+	if _, _, err := net.SplitHostPort(proxyHost); err != nil {
+		defaultPort := "1080"
+		if scheme != "socks5" {
+			defaultPort = "8080"
+		}
+		proxyHost = net.JoinHostPort(proxyHost, defaultPort)
+	}
 
 	switch scheme {
-	case "http", "https":
-		if proxyPort == "" {
-			if scheme == "https" {
-				proxyPort = "443"
-			} else {
-				proxyPort = "8080"
-			}
-		}
-		proxyAddr := net.JoinHostPort(proxyHost, proxyPort)
-
-		proxyIPs, err := resolveHost(ctx, proxyHost, protector)
-		if err != nil {
-			return nil, fmt.Errorf("cannot resolve upstream HTTP proxy host %s: %w", proxyHost, err)
-		}
-
-		var rawConn net.Conn
-		var lastErr error
-		for _, ip := range proxyIPs {
-			dialAddr := net.JoinHostPort(ip.String(), proxyPort)
-			rawConn, lastErr = dialWithProtection(ctx, "tcp", dialAddr, protector)
-			if lastErr == nil {
-				break
-			}
-		}
-		if rawConn == nil {
-			return nil, fmt.Errorf("failed connecting to upstream HTTP proxy %s: %w", proxyAddr, lastErr)
-		}
-
-		if scheme == "https" {
-			tlsConn := tls.Client(rawConn, &tls.Config{ServerName: proxyHost})
-			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				_ = rawConn.Close()
-				return nil, fmt.Errorf("TLS handshake with upstream proxy failed: %w", err)
-			}
-			rawConn = tlsConn
-		}
-
-		target := net.JoinHostPort(targetHost, targetPort)
-		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
-		if proxyURL.User != nil {
-			auth := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.String()))
-			connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", auth)
-		}
-		connectReq += "Proxy-Connection: Keep-Alive\r\n\r\n"
-
-		if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-			_ = rawConn.Close()
-			return nil, fmt.Errorf("failed sending CONNECT to proxy: %w", err)
-		}
-
-		br := bufio.NewReader(rawConn)
-		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
-		if err != nil {
-			_ = rawConn.Close()
-			return nil, fmt.Errorf("failed reading CONNECT response from proxy: %w", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			_ = rawConn.Close()
-			return nil, fmt.Errorf("upstream proxy refused CONNECT tunnel with status %d", resp.StatusCode)
-		}
-		return rawConn, nil
-
-	case "socks5", "socks5h":
-		if proxyPort == "" {
-			proxyPort = "1080"
-		}
-		proxyAddr := net.JoinHostPort(proxyHost, proxyPort)
-
-		proxyIPs, err := resolveHost(ctx, proxyHost, protector)
-		if err != nil {
-			return nil, fmt.Errorf("cannot resolve upstream SOCKS5 host %s: %w", proxyHost, err)
-		}
-
-		var directDialer proxy.ContextDialer = &netDialerWrapper{
-			protector: protector,
-			proxyIPs:  proxyIPs,
-			proxyPort: proxyPort,
-		}
-
+	case "socks5":
 		var auth *proxy.Auth
-		if proxyURL.User != nil {
-			pwd, _ := proxyURL.User.Password()
+		if proxyParsed.User != nil {
+			pwd, _ := proxyParsed.User.Password()
 			auth = &proxy.Auth{
-				User:     proxyURL.User.Username(),
+				User:     proxyParsed.User.Username(),
 				Password: pwd,
 			}
 		}
-
-		socksDialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, directDialer)
+		dialer, err := proxy.SOCKS5("tcp", proxyHost, auth, baseDialer)
 		if err != nil {
-			return nil, fmt.Errorf("failed initializing SOCKS5 dialer: %w", err)
+			return nil, fmt.Errorf("create socks5 dialer: %w", err)
+		}
+		// Proxy resolves the destination hostname remotely
+		targetAddr := net.JoinHostPort(host, port)
+		if ctxDialer, ok := dialer.(proxy.ContextDialer); ok {
+			return ctxDialer.DialContext(ctx, "tcp", targetAddr)
+		}
+		return dialer.Dial("tcp", targetAddr)
+
+	case "http", "https":
+		proxyConn, err := baseDialer.DialContext(ctx, "tcp", proxyHost)
+		if err != nil {
+			return nil, fmt.Errorf("connect to http proxy: %w", err)
 		}
 
-		target := net.JoinHostPort(targetHost, targetPort)
-		if ctxDialer, ok := socksDialer.(proxy.ContextDialer); ok {
-			return ctxDialer.DialContext(ctx, "tcp", target)
+		targetHostPort := net.JoinHostPort(host, port)
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n", targetHostPort, targetHostPort)
+		if proxyParsed.User != nil {
+			username := proxyParsed.User.Username()
+			password, _ := proxyParsed.User.Password()
+			encoded := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+			connectReq = fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\nProxy-Authorization: Basic %s\r\n\r\n", targetHostPort, targetHostPort, encoded)
 		}
-		return socksDialer.Dial("tcp", target)
+
+		if _, err := proxyConn.Write([]byte(connectReq)); err != nil {
+			_ = proxyConn.Close()
+			return nil, fmt.Errorf("write http proxy CONNECT: %w", err)
+		}
+
+		br := bufio.NewReader(proxyConn)
+		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+		if err != nil {
+			_ = proxyConn.Close()
+			return nil, fmt.Errorf("read http proxy response: %w", err)
+		}
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			_ = proxyConn.Close()
+			return nil, fmt.Errorf("http proxy CONNECT refused with status: %s", resp.Status)
+		}
+
+		if br.Buffered() > 0 {
+			return &ffBufferedConn{r: br, Conn: proxyConn}, nil
+		}
+		return proxyConn, nil
 
 	default:
-		return nil, fmt.Errorf("unsupported proxy scheme: %s", scheme)
+		return nil, fmt.Errorf("unsupported proxy scheme %q", scheme)
 	}
 }
 
-type netDialerWrapper struct {
-	protector SocketProtector
-	proxyIPs  []net.IP
-	proxyPort string
-}
+func ffGetOrCreateClient() (*http.Client, error) {
+	ffConfigLock.Lock()
+	defer ffConfigLock.Unlock()
 
-func (w *netDialerWrapper) Dial(network, addr string) (net.Conn, error) {
-	return w.DialContext(context.Background(), network, addr)
-}
+	if ffHTTPClient != nil {
+		return ffHTTPClient, nil
+	}
 
-func (w *netDialerWrapper) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	var lastErr error
-	for _, ip := range w.proxyIPs {
-		dialAddr := net.JoinHostPort(ip.String(), w.proxyPort)
-		conn, err := dialWithProtection(ctx, network, dialAddr, w.protector)
-		if err == nil {
-			return conn, nil
+	if ffCookieJar == nil {
+		jar, err := cookiejar.New(nil)
+		if err != nil {
+			return nil, fmt.Errorf("cookiejar: %w", err)
 		}
-		lastErr = err
+		ffCookieJar = jar
 	}
-	return nil, fmt.Errorf("failed connecting to any proxy IP: %w", lastErr)
+
+	transport := &http.Transport{
+		Proxy:               nil,
+		DisableCompression: true, // Do not add default Accept-Encoding: gzip; strictly send caller headers
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return ffDialWithOptionalProxy(ctx, address)
+		},
+		DialTLSContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				host = address
+			}
+
+			raw, err := ffDialWithOptionalProxy(ctx, address)
+			if err != nil {
+				return nil, err
+			}
+
+			// Complete desktop Firefox 158 TLS ClientHello handshake
+			conn, err := ffHandshakeTLS(ctx, raw, host, nil, ffSessions, "http/1.1")
+			if err != nil {
+				return nil, err
+			}
+			return conn, nil
+		},
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          64,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	ffHTTPClient = &http.Client{
+		Transport:     transport,
+		Jar:           ffCookieJar,
+		Timeout:       35 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	return ffHTTPClient, nil
 }
 
-func dialTarget(ctx context.Context, host, port string, protector SocketProtector) (net.Conn, error) {
-	upstream := getUpstreamProxy()
-	if upstream != nil {
-		return dialUpstreamProxy(ctx, upstream, host, port, protector)
-	}
-
-	ips, err := resolveHost(ctx, host, protector)
+// FirefoxFetch executes an HTTP request using Desktop Firefox 158 uTLS ClientHello.
+// It sends ONLY the exact headers provided by the caller in headersJSON without injecting any default or synthetic headers.
+// Automatically routes through upstream proxy (if configured) and resolves via DoH (if configured).
+// Sockets are protected via VpnService.protect (if FirefoxSetSocketProtector is registered).
+// Gomobile export: io.nekohasekai.libbox.Libbox.firefoxFetch(...)
+func FirefoxFetch(method string, targetURL string, headersJSON string, body []byte, timeoutSeconds int32) (*FirefoxResponse, error) {
+	client, err := ffGetOrCreateClient()
 	if err != nil {
 		return nil, err
 	}
 
-	var lastErr error
-	for _, ip := range ips {
-		addr := net.JoinHostPort(ip.String(), port)
-		conn, err := dialWithProtection(ctx, "tcp", addr, protector)
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = err
+	cleanMethod := strings.ToUpper(strings.TrimSpace(method))
+	if cleanMethod == "" {
+		cleanMethod = http.MethodGet
 	}
-	return nil, fmt.Errorf("failed connecting to %s:%s (tried %d IPs): %w", host, port, len(ips), lastErr)
-}
 
-func FirefoxFetch(method string, targetURL string, headersJSON string, body []byte, timeoutSeconds int32) (*FirefoxResponse, error) {
-	if timeoutSeconds <= 0 {
-		timeoutSeconds = 30
+	cleanURL := strings.TrimSpace(targetURL)
+	if cleanURL == "" {
+		return nil, errors.New("targetURL must not be empty")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+
+	timeout := 30 * time.Second
+	if timeoutSeconds > 0 {
+		timeout = time.Duration(timeoutSeconds) * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-
-	parsedURL, err := url.Parse(targetURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid URL: %w", err)
-	}
-	scheme := strings.ToLower(parsedURL.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return nil, fmt.Errorf("unsupported scheme: %s", scheme)
-	}
-
-	host := parsedURL.Hostname()
-	port := parsedURL.Port()
-	if port == "" {
-		if scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
-
-	protector := getSocketProtector()
 
 	var bodyReader io.Reader
 	if len(body) > 0 {
 		bodyReader = bytes.NewReader(body)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(method), targetURL, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, cleanMethod, cleanURL, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("failed building request: %w", err)
+		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	if headersJSON != "" {
-		var headersMap map[string]interface{}
-		if err := json.Unmarshal([]byte(headersJSON), &headersMap); err == nil {
-			for k, v := range headersMap {
+	// Reset headers to guarantee NO default or automatic headers are injected by Go
+	req.Header = make(http.Header)
+
+	// Apply STRICTLY and ONLY headers passed by caller in headersJSON
+	if strings.TrimSpace(headersJSON) != "" && headersJSON != "{}" {
+		var headerMap map[string]interface{}
+		if err := json.Unmarshal([]byte(headersJSON), &headerMap); err == nil {
+			for k, v := range headerMap {
+				if v == nil {
+					continue
+				}
+				if strings.EqualFold(k, "host") {
+					req.Host = fmt.Sprint(v)
+					continue
+				}
 				switch val := v.(type) {
 				case string:
 					req.Header.Set(k, val)
 				case []interface{}:
-					req.Header.Del(k)
 					for _, item := range val {
-						if s, ok := item.(string); ok {
-							req.Header.Add(k, s)
+						if item != nil {
+							req.Header.Add(k, fmt.Sprint(item))
 						}
 					}
+				default:
+					req.Header.Set(k, fmt.Sprint(val))
 				}
 			}
 		}
 	}
 
-	globalJarMu.RLock()
-	jar := globalJar
-	globalJarMu.RUnlock()
-	if jar != nil {
-		for _, cookie := range jar.Cookies(parsedURL) {
-			req.AddCookie(cookie)
-		}
-	}
-
-	transport := &http.Transport{
-		DisableCompression: true,
-		ForceAttemptHTTP2:  false,
-		DialContext: func(dCtx context.Context, network, addr string) (net.Conn, error) {
-			return dialTarget(dCtx, host, port, protector)
-		},
-		DialTLSContext: func(dCtx context.Context, network, addr string) (net.Conn, error) {
-			rawConn, err := dialTarget(dCtx, host, port, protector)
-			if err != nil {
-				return nil, err
-			}
-			return handshakeFirefoxTLS(dCtx, rawConn, host, nil, nil, "http/1.1")
-		},
-	}
-
-	client := &http.Client{
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if jar != nil {
-		if rc := resp.Cookies(); len(rc) > 0 {
-			jar.SetCookies(parsedURL, rc)
-		}
-	}
-
-	respBody, err := io.ReadAll(resp.Body)
+	// Limit to 16MB to protect Android memory
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
 	if err != nil {
-		return nil, fmt.Errorf("failed reading response body: %w", err)
+		return nil, fmt.Errorf("read response body: %w", err)
 	}
 
-	headersOut := make(map[string][]string)
+	respHeaderMap := make(map[string][]string)
 	for k, v := range resp.Header {
-		headersOut[k] = v
+		respHeaderMap[k] = v
 	}
-	headerJSONBytes, _ := json.Marshal(headersOut)
+	headerBytes, _ := json.Marshal(respHeaderMap)
 
 	return &FirefoxResponse{
 		StatusCode: int32(resp.StatusCode),
-		HeaderJSON: string(headerJSONBytes),
+		HeaderJSON: string(headerBytes),
 		Body:       respBody,
 	}, nil
 }
