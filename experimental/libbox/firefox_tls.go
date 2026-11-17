@@ -12,8 +12,11 @@ import (
 // ffCurveX25519MLKEM768 is the IANA TLS ID for X25519MLKEM768 (0x11ec).
 const ffCurveX25519MLKEM768 utls.CurveID = 0x11ec
 
-// ffFirefoxHelloSpec creates the ClientHello of desktop Firefox 158 in its exact extension order,
-// identical to Arman's firefoxtls.Hello implementation.
+// ffFirefoxHelloSpec is adapted from arman-vpn-client core/internal/firefoxtls
+// (commit 492dd7f389c539790cde3d07167535d28788a0d0, GPL-3.0).
+// It defines a version-pinned Firefox 158-style ClientHello.
+// The full browser fingerprint depends on more than the ClientHello and must
+// be verified separately against real browser captures.
 func ffFirefoxHelloSpec(alpn ...string) *utls.ClientHelloSpec {
 	return &utls.ClientHelloSpec{
 		TLSVersMin: utls.VersionTLS12,
