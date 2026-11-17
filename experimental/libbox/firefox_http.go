@@ -79,6 +79,7 @@ type ffNetworkSnapshot struct {
 	dohClient                                                  *http.Client
 	network                                                    FirefoxNetwork
 	connectTimeout                                             time.Duration
+	lookupSlots                                                chan struct{}
 	roots                                                      *x509.CertPool // explicit roots for isolated local tests
 }
 type ffNetworkSnapshotKey struct{}
@@ -409,7 +410,21 @@ func ffLookupPlatform(ctx context.Context, network FirefoxNetwork, host string) 
 		err   error
 	}
 	ch := make(chan result, 1)
-	go func() { value, err := network.LookupIP(host); ch <- result{value, err} }()
+	slots := ffSnapshotFrom(ctx).lookupSlots
+	if slots != nil {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	go func() {
+		if slots != nil {
+			defer func() { <-slots }()
+		}
+		value, err := network.LookupIP(host)
+		ch <- result{value, err}
+	}()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1339,7 +1354,7 @@ func FirefoxNewClient(proxyURL, dohURL string, network FirefoxNetwork, requirePr
 	if connectTimeoutMillis <= 0 || connectTimeoutMillis > int64((1<<63-1)/int64(time.Millisecond)) {
 		return nil, errors.New("invalid connect timeout")
 	}
-	cfg := ffNetworkSnapshot{proxy: proxyURL, doh: dohURL, localDNS: localProxyDNS, requireProtection: requireProtection, allowPrivate: allowPrivateDNS, network: network, dohClient: ffNewDoHClient(), connectTimeout: time.Duration(connectTimeoutMillis) * time.Millisecond}
+	cfg := ffNetworkSnapshot{proxy: proxyURL, doh: dohURL, localDNS: localProxyDNS, requireProtection: requireProtection, allowPrivate: allowPrivateDNS, network: network, dohClient: ffNewDoHClient(), connectTimeout: time.Duration(connectTimeoutMillis) * time.Millisecond, lookupSlots: make(chan struct{}, 4)}
 	if network != nil {
 		cfg.protector = network
 	}
