@@ -35,12 +35,21 @@ type FirefoxResponse struct {
 	StatusCode int32
 	HeaderJSON string
 	Body       []byte
+	Protocol   string
 }
 
 // SocketProtector allows Android VpnService to protect outbound sockets from looping into the VPN TUN.
 // Gomobile binds this as io.nekohasekai.libbox.SocketProtector.
 type SocketProtector interface {
 	Protect(fd int32) error
+}
+
+// FirefoxNetwork supplies platform DNS and socket protection/network binding.
+// LookupIP returns a JSON array of numeric IP addresses. Protect is called
+// before connect and must return an error if protection or binding fails.
+type FirefoxNetwork interface {
+	Protect(fd int32) error
+	LookupIP(host string) (string, error)
 }
 
 var (
@@ -68,6 +77,9 @@ type ffNetworkSnapshot struct {
 	localDNS, requireProtection, allowPrivate, followRedirects bool
 	protector                                                  SocketProtector
 	dohClient                                                  *http.Client
+	network                                                    FirefoxNetwork
+	connectTimeout                                             time.Duration
+	roots                                                      *x509.CertPool // explicit roots for isolated local tests
 }
 type ffNetworkSnapshotKey struct{}
 
@@ -122,7 +134,7 @@ func ffNewDoHClientWithRoots(roots *x509.CertPool) *http.Client {
 				})
 			}
 		}
-		return dialer.DialContext(ctx, network, address)
+		return ffDialBootstrap(ctx, dialer, network, address)
 	}
 	dialTLS := func(ctx context.Context, network, address string, alpn ...string) (*utls.UConn, error) {
 		host, _, err := net.SplitHostPort(address)
@@ -272,30 +284,38 @@ func FirefoxSetUpstreamProxy(proxyURL string) error {
 	ffConfigLock.Lock()
 	defer ffConfigLock.Unlock()
 
+	trimmed, err := ffValidateProxyURL(proxyURL)
+	if err != nil {
+		return err
+	}
+	ffUpstreamProxy = trimmed
+	ffCloseIdleLocked()
+	return nil
+}
+
+func ffValidateProxyURL(proxyURL string) (string, error) {
 	trimmed := strings.TrimSpace(proxyURL)
 	if trimmed != "" {
 		parsed, err := url.Parse(trimmed)
 		if err != nil {
-			return errors.New("invalid proxy URL")
+			return "", errors.New("invalid proxy URL")
 		}
 		scheme := strings.ToLower(parsed.Scheme)
 		if scheme != "socks5" && scheme != "http" && scheme != "https" {
-			return fmt.Errorf("unsupported proxy scheme %q", scheme)
+			return "", fmt.Errorf("unsupported proxy scheme %q", scheme)
 		}
 		if parsed.Hostname() == "" || parsed.Opaque != "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return errors.New("proxy URL must contain only a scheme, host, optional port and credentials")
+			return "", errors.New("proxy URL must contain only a scheme, host, optional port and credentials")
 		}
 		if port := parsed.Port(); port != "" {
 			n, err := strconv.Atoi(port)
 			if err != nil || n < 1 || n > 65535 {
-				return errors.New("invalid proxy port")
+				return "", errors.New("invalid proxy port")
 			}
 		}
 	}
 
-	ffUpstreamProxy = trimmed
-	ffCloseIdleLocked()
-	return nil
+	return trimmed, nil
 }
 
 // FirefoxSetDoH sets a DNS-over-HTTPS URL (e.g. "https://cloudflare-dns.com/dns-query" or "https://dns.google/dns-query").
@@ -381,8 +401,87 @@ func FirefoxGetCookies(targetURL string) string {
 	return strings.Join(parts, "; ")
 }
 
+// Platform callbacks may block in OS DNS; the request can stop waiting on cancel.
+// The callback itself cannot be forcibly interrupted across the mobile bridge.
+func ffLookupPlatform(ctx context.Context, network FirefoxNetwork, host string) ([]net.IP, error) {
+	type result struct {
+		value string
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() { value, err := network.LookupIP(host); ch <- result{value, err} }()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		if r.err != nil {
+			return nil, r.err
+		}
+		var values []string
+		if err := json.Unmarshal([]byte(r.value), &values); err != nil {
+			return nil, errors.New("invalid platform DNS response")
+		}
+		var ips []net.IP
+		seen := make(map[string]bool)
+		for _, value := range values {
+			ip := net.ParseIP(value)
+			if ip == nil || ip.IsUnspecified() || ip.IsMulticast() {
+				return nil, errors.New("invalid platform DNS address")
+			}
+			if !seen[ip.String()] {
+				ips = append(ips, ip)
+				seen[ip.String()] = true
+			}
+		}
+		if len(ips) == 0 {
+			return nil, errors.New("platform DNS returned no addresses")
+		}
+		return ips, nil
+	}
+}
+
+func ffDialBootstrap(ctx context.Context, d *net.Dialer, network, address string) (net.Conn, error) {
+	cfg := ffSnapshotFrom(ctx)
+	if cfg.network == nil {
+		return d.DialContext(ctx, network, address)
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	if net.ParseIP(host) != nil {
+		return d.DialContext(ctx, network, address)
+	}
+	ips, err := ffLookupPlatform(ctx, cfg.network, host)
+	if err != nil {
+		return nil, err
+	}
+	addresses := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		addresses = append(addresses, ip.String())
+	}
+	return ffRaceDial(ctx, addresses, func(ctx context.Context, ip string) (net.Conn, error) {
+		return d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+	})
+}
+
+type ffPlatformDialer struct {
+	ctx    context.Context
+	dialer *net.Dialer
+}
+
+func (d *ffPlatformDialer) Dial(network, address string) (net.Conn, error) {
+	return ffDialBootstrap(d.ctx, d.dialer, network, address)
+}
+func (d *ffPlatformDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return ffDialBootstrap(ctx, d.dialer, network, address)
+}
+
 func ffNewProtectedDialer(ctx context.Context, timeout time.Duration) *net.Dialer {
 	cfg := ffSnapshotFrom(ctx)
+	if cfg.connectTimeout > 0 {
+		timeout = cfg.connectTimeout
+	}
 	return &net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 30 * time.Second,
@@ -442,6 +541,23 @@ func ffResolveHost(ctx context.Context, host string) ([]string, error) {
 		return nil, fmt.Errorf("custom DNS resolution for %s: %w", host, err)
 	}
 
+	// Android supplies DNS bound to the same network as the sockets.
+	if cfg.network != nil {
+		ips, err := ffLookupPlatform(ctx, cfg.network, host)
+		if err != nil {
+			return nil, err
+		}
+		var result []string
+		for _, ip := range ips {
+			if ffAllowedIP(ctx, ip) {
+				result = append(result, ip.String())
+			}
+		}
+		if len(result) == 0 {
+			return nil, errors.New("no permitted resolved address")
+		}
+		return result, nil
+	}
 	// System resolver is used only when no DNS override is configured.
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
@@ -826,6 +942,11 @@ func ffDialWithOptionalProxy(ctx context.Context, address string) (net.Conn, err
 }
 func ffDialWithOptionalProxyMode(ctx context.Context, address string, applyLocalDNS bool) (net.Conn, error) {
 	ctx = ffWithSnapshot(ctx)
+	if cfg := ffSnapshotFrom(ctx); cfg.connectTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.connectTimeout)
+		defer cancel()
+	}
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		host = address
@@ -904,7 +1025,7 @@ func ffDialProxy(ctx context.Context, proxyStr, host, port string) (net.Conn, er
 				Password: pwd,
 			}
 		}
-		dialer, err := proxy.SOCKS5("tcp", proxyHost, auth, baseDialer)
+		dialer, err := proxy.SOCKS5("tcp", proxyHost, auth, &ffPlatformDialer{ctx: ctx, dialer: baseDialer})
 		if err != nil {
 			return nil, fmt.Errorf("create socks5 dialer: %w", err)
 		}
@@ -916,7 +1037,7 @@ func ffDialProxy(ctx context.Context, proxyStr, host, port string) (net.Conn, er
 		return dialer.Dial("tcp", targetAddr)
 
 	case "http", "https":
-		proxyConn, err := baseDialer.DialContext(ctx, "tcp", proxyHost)
+		proxyConn, err := ffDialBootstrap(ctx, baseDialer, "tcp", proxyHost)
 		if err != nil {
 			return nil, fmt.Errorf("connect to http proxy: %w", err)
 		}
@@ -925,7 +1046,11 @@ func ffDialProxy(ctx context.Context, proxyStr, host, port string) (net.Conn, er
 		tcpConn := proxyConn
 		stopCancel := context.AfterFunc(ctx, func() { _ = tcpConn.Close() })
 		defer stopCancel()
-		deadline := time.Now().Add(20 * time.Second)
+		timeout := 20 * time.Second
+		if cfg := ffSnapshotFrom(ctx); cfg.connectTimeout > 0 {
+			timeout = cfg.connectTimeout
+		}
+		deadline := time.Now().Add(timeout)
 		if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 			deadline = d
 		}
@@ -1016,7 +1141,21 @@ func ffGetOrCreateClientLocked(useHTTP2 bool) (*http.Client, error) {
 		ffCookieJar = jar
 	}
 
-	cfg := ffSnapshotLocked()
+	cache := ffSessions
+	if useHTTP2 {
+		cache = ffHTTP2Sessions
+	}
+	client := ffBuildClient(ffSnapshotLocked(), ffCookieJar, useHTTP2, cache)
+	if useHTTP2 {
+		ffHTTP2Client = client
+	} else {
+		ffHTTPClient = client
+	}
+	return client, nil
+}
+
+// ffBuildClient captures an immutable routing snapshot and does not own its jar.
+func ffBuildClient(cfg ffNetworkSnapshot, jar http.CookieJar, useHTTP2 bool, cache utls.ClientSessionCache) *http.Client {
 	withCfg := func(ctx context.Context) context.Context { return context.WithValue(ctx, ffNetworkSnapshotKey{}, cfg) }
 
 	if useHTTP2 {
@@ -1034,9 +1173,13 @@ func ffGetOrCreateClientLocked(useHTTP2 bool) (*http.Client, error) {
 				if err != nil {
 					return nil, err
 				}
-				shakeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				handshakeTimeout := 15 * time.Second
+				if cfg.connectTimeout > 0 {
+					handshakeTimeout = cfg.connectTimeout
+				}
+				shakeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 				defer cancel()
-				conn, err := ffHandshakeTLS(shakeCtx, raw, host, nil, ffHTTP2Sessions, "h2", "http/1.1")
+				conn, err := ffHandshakeTLS(shakeCtx, raw, host, cfg.roots, cache, "h2", "http/1.1")
 				if err != nil {
 					return nil, err
 				}
@@ -1047,8 +1190,7 @@ func ffGetOrCreateClientLocked(useHTTP2 bool) (*http.Client, error) {
 				return conn, nil
 			},
 		}
-		ffHTTP2Client = &http.Client{Transport: transport, Jar: ffCookieJar, CheckRedirect: ffRedirectPolicy(cfg.followRedirects)}
-		return ffHTTP2Client, nil
+		return &http.Client{Transport: transport, Jar: jar, CheckRedirect: ffRedirectPolicy(cfg.followRedirects)}
 	}
 
 	transport := &http.Transport{
@@ -1070,9 +1212,13 @@ func ffGetOrCreateClientLocked(useHTTP2 bool) (*http.Client, error) {
 			}
 
 			// Complete a version-pinned Firefox-style TLS handshake
-			shakeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			handshakeTimeout := 15 * time.Second
+			if cfg.connectTimeout > 0 {
+				handshakeTimeout = cfg.connectTimeout
+			}
+			shakeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 			defer cancel()
-			conn, err := ffHandshakeTLS(shakeCtx, raw, host, nil, ffSessions, "http/1.1")
+			conn, err := ffHandshakeTLS(shakeCtx, raw, host, cfg.roots, cache, "http/1.1")
 			if err != nil {
 				return nil, err
 			}
@@ -1086,14 +1232,13 @@ func ffGetOrCreateClientLocked(useHTTP2 bool) (*http.Client, error) {
 		ExpectContinueTimeout:  1 * time.Second,
 	}
 
-	ffHTTPClient = &http.Client{
+	return &http.Client{
 		Transport: transport,
-		Jar:       ffCookieJar,
+		Jar:       jar,
 		// FirefoxFetch supplies the per-request deadline.
 		Timeout:       0,
 		CheckRedirect: ffRedirectPolicy(cfg.followRedirects),
 	}
-	return ffHTTPClient, nil
 }
 
 // errFirefoxNoHTTP2 is emitted only before any HTTP request bytes are sent.
@@ -1160,6 +1305,75 @@ func ffGetOrCreateAutoClient() (*http.Client, error) {
 	return ffHTTPAutoClient, nil
 }
 
+// FirefoxClient is an isolated, reusable transport. It has no cookie jar and
+// never follows redirects: the application owns cookies and redirect policy.
+// A client captures its network and configuration at creation; replace and close
+// it whenever routing or the selected Android network changes.
+type FirefoxClient struct {
+	client    *http.Client
+	dohClient *http.Client
+	maxBody   int64
+}
+
+// FirefoxNewClient creates an independent Firefox-style client. network may be
+// nil only when socket protection and Android network-bound DNS are not needed.
+// DoH is used for destination DNS; its bootstrap and proxy hostname use network.
+func FirefoxNewClient(proxyURL, dohURL string, network FirefoxNetwork, requireProtection, allowPrivateDNS, localProxyDNS bool, maxBody, connectTimeoutMillis int64) (*FirefoxClient, error) {
+	proxyURL, err := ffValidateProxyURL(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	dohURL = strings.TrimSpace(dohURL)
+	if dohURL != "" {
+		u, err := url.Parse(dohURL)
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.Opaque != "" {
+			return nil, errors.New("DoH URL must be an absolute HTTPS URL without credentials or fragment")
+		}
+	}
+	if requireProtection && network == nil {
+		return nil, errors.New("socket protection requires a network callback")
+	}
+	if maxBody <= 0 || maxBody == int64(^uint64(0)>>1) {
+		return nil, errors.New("invalid response size limit")
+	}
+	if connectTimeoutMillis <= 0 || connectTimeoutMillis > int64((1<<63-1)/int64(time.Millisecond)) {
+		return nil, errors.New("invalid connect timeout")
+	}
+	cfg := ffNetworkSnapshot{proxy: proxyURL, doh: dohURL, localDNS: localProxyDNS, requireProtection: requireProtection, allowPrivate: allowPrivateDNS, network: network, dohClient: ffNewDoHClient(), connectTimeout: time.Duration(connectTimeoutMillis) * time.Millisecond}
+	if network != nil {
+		cfg.protector = network
+	}
+	h1 := ffBuildClient(cfg, nil, false, utls.NewLRUClientSessionCache(64))
+	h2 := ffBuildClient(cfg, nil, true, utls.NewLRUClientSessionCache(64))
+	return &FirefoxClient{client: &http.Client{Transport: &ffAutoTransport{h1: h1.Transport, h2: h2.Transport}, CheckRedirect: ffRedirectPolicy(false)}, dohClient: cfg.dohClient, maxBody: maxBody}, nil
+}
+
+// NewRequest constructs a cancellable, single-use request. The timeout starts
+// immediately; timeoutMillis must be positive. Request bodies are buffered.
+func (c *FirefoxClient) NewRequest(method, targetURL, headersJSON string, body []byte, timeoutMillis int64) (*FirefoxRequest, error) {
+	if c == nil || c.client == nil {
+		return nil, errors.New("uninitialized Firefox client")
+	}
+	if timeoutMillis <= 0 || timeoutMillis > int64((1<<63-1)/int64(time.Millisecond)) {
+		return nil, errors.New("invalid timeout")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMillis)*time.Millisecond)
+	return &FirefoxRequest{method: method, targetURL: targetURL, headersJSON: headersJSON, body: append([]byte(nil), body...), ctx: ctx, cancel: cancel, auto: true, client: c.client, maxBody: c.maxBody}, nil
+}
+
+// Close releases idle connections; active requests should be cancelled separately.
+func (c *FirefoxClient) Close() {
+	if c == nil {
+		return
+	}
+	if c.client != nil {
+		c.client.CloseIdleConnections()
+	}
+	if c.dohClient != nil {
+		c.dohClient.CloseIdleConnections()
+	}
+}
+
 // FirefoxFetchAuto negotiates HTTP/2 with an HTTP/1.1 fallback.
 func FirefoxFetchAuto(method, targetURL, headersJSON string, body []byte, timeoutSeconds int32) (*FirefoxResponse, error) {
 	return FirefoxNewAutoRequest(method, targetURL, headersJSON, body, timeoutSeconds).Execute()
@@ -1199,6 +1413,8 @@ type FirefoxRequest struct {
 	cancel                         context.CancelFunc
 	mu                             sync.Mutex
 	used                           bool
+	client                         *http.Client
+	maxBody                        int64
 }
 
 // FirefoxNewRequest creates a single-use cancellable request. The timeout starts now.
@@ -1210,8 +1426,15 @@ func FirefoxNewRequest(method string, targetURL string, headersJSON string, body
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	return &FirefoxRequest{method: method, targetURL: targetURL, headersJSON: headersJSON, body: append([]byte(nil), body...), useHTTP2: useHTTP2, ctx: ctx, cancel: cancel}
 }
-func (r *FirefoxRequest) Cancel() { r.cancel() }
+func (r *FirefoxRequest) Cancel() {
+	if r != nil && r.cancel != nil {
+		r.cancel()
+	}
+}
 func (r *FirefoxRequest) Execute() (*FirefoxResponse, error) {
+	if r == nil || r.ctx == nil || r.cancel == nil {
+		return nil, errors.New("uninitialized Firefox request")
+	}
 	r.mu.Lock()
 	if r.used {
 		r.mu.Unlock()
@@ -1220,18 +1443,19 @@ func (r *FirefoxRequest) Execute() (*FirefoxResponse, error) {
 	r.used = true
 	r.mu.Unlock()
 	defer r.cancel()
-	return ffExecuteRequest(r.ctx, r.method, r.targetURL, r.headersJSON, r.body, r.useHTTP2, r.auto)
+	return ffExecuteRequest(r.ctx, r.method, r.targetURL, r.headersJSON, r.body, r.useHTTP2, r.auto, r.client, r.maxBody)
 }
-func ffExecuteRequest(ctx context.Context, method, targetURL, headersJSON string, body []byte, useHTTP2, auto bool) (*FirefoxResponse, error) {
-	ffConfigLock.RLock()
-	maxBody := ffMaxResponseBytes
-	ffConfigLock.RUnlock()
-	var client *http.Client
+func ffExecuteRequest(ctx context.Context, method, targetURL, headersJSON string, body []byte, useHTTP2, auto bool, client *http.Client, maxBody int64) (*FirefoxResponse, error) {
 	var err error
-	if auto {
-		client, err = ffGetOrCreateAutoClient()
-	} else {
-		client, err = ffGetOrCreateClientForMode(useHTTP2)
+	if client == nil {
+		ffConfigLock.RLock()
+		maxBody = ffMaxResponseBytes
+		ffConfigLock.RUnlock()
+		if auto {
+			client, err = ffGetOrCreateAutoClient()
+		} else {
+			client, err = ffGetOrCreateClientForMode(useHTTP2)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -1327,5 +1551,6 @@ func ffExecuteRequest(ctx context.Context, method, targetURL, headersJSON string
 		StatusCode: int32(resp.StatusCode),
 		HeaderJSON: string(headerBytes),
 		Body:       respBody,
+		Protocol:   resp.Proto,
 	}, nil
 }
