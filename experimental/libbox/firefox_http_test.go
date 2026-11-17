@@ -1442,3 +1442,42 @@ func TestIsolatedClientNegotiatesHTTP2OrHTTP1(t *testing.T) {
 		})
 	}
 }
+
+type blockedTestNetwork struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (*blockedTestNetwork) Protect(int32) error { return nil }
+func (n *blockedTestNetwork) LookupIP(string) (string, error) {
+	n.entered <- struct{}{}
+	<-n.release
+	return `["127.0.0.1"]`, nil
+}
+func TestPlatformDNSLimitsUninterruptibleCallbacks(t *testing.T) {
+	n := &blockedTestNetwork{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	defer close(n.release)
+	cfg := ffNetworkSnapshot{network: n, lookupSlots: make(chan struct{}, 2)}
+	ctx := context.WithValue(context.Background(), ffNetworkSnapshotKey{}, cfg)
+	for i := 0; i < 2; i++ {
+		ctxShort, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+		_, err := ffLookupPlatform(ctxShort, n, "test.example")
+		cancel()
+		if err == nil {
+			t.Fatal("expected cancellation")
+		}
+	}
+	for i := 0; i < 2; i++ {
+		<-n.entered
+	}
+	ctxShort, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, err := ffLookupPlatform(ctxShort, n, "test.example"); err == nil {
+		t.Fatal("expected bounded wait")
+	}
+	select {
+	case <-n.entered:
+		t.Fatal("exceeded callback limit")
+	default:
+	}
+}
